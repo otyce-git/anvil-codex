@@ -1,0 +1,35 @@
+{
+  "name": "evidence-forge",
+  "version": "0.1.0",
+  "description": "Evidence-first coding workflow with SQL-tracked verification, adversarial review, and scoped commits.",
+  "author": {
+    "name": "Otyce"
+  },
+  "homepage": "https://github.com/otyce-git/anvil-codex",
+  "repository": "https://github.com/otyce-git/anvil-codex",
+  "license": "MIT",
+  "keywords": [
+    "verification",
+    "code-review",
+    "evidence",
+    "sqlite",
+    "commit"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Evidence Forge",
+    "shortDescription": "Verify changes before presenting them.",
+    "longDescription": "A Codex-oriented evidence-first coding workflow inspired by Burke Holland's Anvil. It surveys existing patterns, captures a baseline, records verification in SQLite, runs adversarial review, and creates a scoped commit with rollback instructions.",
+    "developerName": "Otyce",
+    "category": "Productivity",
+    "capabilities": [
+      "Write",
+      "Interactive"
+    ],
+    "defaultPrompt": [
+      "Use Evidence Forge to implement this change.",
+      "Run an evidence-first fix for this bug.",
+      "Verify and commit this change with Evidence Forge."
+    ]
+  }
+}
