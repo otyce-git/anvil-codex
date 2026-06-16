@@ -20,7 +20,8 @@ Codex-oriented implementation and is not affiliated with or endorsed by Burke Ho
 - Searches for existing code patterns and pushes back on risky or duplicative approaches.
 - Captures baseline build, test, lint, type-check, parse, or diagnostic evidence before edits.
 - Records after-change verification in `.evidence-forge/ledger.sqlite`.
-- Runs optional `codex`, `claude`, and `gemini` CLI reviewers when installed and authenticated.
+- Runs optional `codex`, GPT-backed Codex, `claude`, and `gemini` CLI reviewers when installed and authenticated.
+- Supports a blocking `review-required` gate that waits for both Codex and GPT reviews to finish, fail, skip, or time out.
 - Generates reports from SQL evidence instead of unsupported claims.
 - Commits only registered task files and refuses to include unrelated worktree changes.
 
@@ -32,6 +33,7 @@ Requirements:
 - Git
 - Python 3.10 or newer
 - Optional reviewer CLIs: `codex`, `claude`, and `gemini`
+- Optional GPT review model override: `EVIDENCE_FORGE_GPT_REVIEW_MODEL` (defaults to `gpt-5.4`)
 
 Add this GitHub repository as a Codex marketplace:
 

@@ -61,8 +61,9 @@ Treat uncertain tasks as Medium.
    - Minimum after-change signals: two for Medium, three for Large.
    - Fix failures and rerun them. Do not present newly broken code.
    - Stage only task files before review.
-   - Prefer available Codex subagents for independent review. When vendor CLIs are configured, the
-     ledger CLI can run `codex`, `claude`, and `gemini` reviewers with the `review` command.
+   - Prefer available Codex subagents for independent review. When Codex + GPT review is requested,
+     run `review-required`; it blocks until both `codex review` passes complete, fail, skip, or time
+     out. For a single reviewer, use `review --reviewer codex|gpt|claude|gemini`.
    - Record skipped or unavailable reviewers honestly. Never describe them as passed.
 
 6. **Evidence and commit**
@@ -84,6 +85,9 @@ python3 /path/to/evidence_forge.py run \
 
 python3 /path/to/evidence_forge.py review \
   --task fix-login-crash --reviewer codex
+
+python3 /path/to/evidence_forge.py review-required \
+  --task fix-login-crash --timeout-seconds 900
 
 python3 /path/to/evidence_forge.py report --task fix-login-crash
 

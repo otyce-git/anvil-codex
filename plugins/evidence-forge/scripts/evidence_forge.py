@@ -8,31 +8,86 @@ import datetime as dt
 import json
 import os
 import pathlib
+import signal
 import shutil
 import sqlite3
 import subprocess
 import sys
+import time
+from dataclasses import dataclass
 from typing import Sequence
 
 
 PHASES = ("baseline", "after", "review", "commit")
+CHECK_STATUSES = ("PASS", "FAIL", "SKIPPED", "TIMEOUT")
+DEFAULT_REVIEW_TIMEOUT_SECONDS = 900
+DEFAULT_MAX_REVIEW_DIFF_CHARS = 200_000
+DEFAULT_GPT_REVIEW_MODEL = "gpt-5.4"
+FORCE_KILL_SIGNAL = getattr(signal, "SIGKILL", None)
 REVIEWERS = {
-    "codex": ["codex", "exec", "--sandbox", "read-only", "--color", "never"],
+    "codex": ["codex", "--sandbox", "read-only", "review"],
+    "gpt": ["codex", "--sandbox", "read-only", "review", "-"],
     "claude": ["claude", "-p", "--permission-mode", "plan"],
     "gemini": ["gemini", "-p"],
 }
 
 
-def run_process(command: Sequence[str], cwd: pathlib.Path, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        list(command),
-        cwd=cwd,
-        input=input_text,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        check=False,
-    )
+@dataclass(frozen=True)
+class ProcessResult:
+    args: Sequence[str]
+    returncode: int
+    stdout: str
+    duration_seconds: float
+    timed_out: bool = False
+
+
+def run_process(
+    command: Sequence[str],
+    cwd: pathlib.Path,
+    input_text: str | None = None,
+    timeout_seconds: int | None = None,
+) -> ProcessResult:
+    started = time.monotonic()
+    kwargs = {
+        "cwd": cwd,
+        "text": True,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,
+        "stdin": subprocess.PIPE if input_text is not None else None,
+    }
+    if os.name != "nt":
+        kwargs["start_new_session"] = True
+
+    process = subprocess.Popen(list(command), **kwargs)
+    try:
+        stdout, _ = process.communicate(input=input_text, timeout=timeout_seconds)
+        return ProcessResult(command, process.returncode, stdout or "", time.monotonic() - started)
+    except KeyboardInterrupt:
+        terminate_process(process, signal.SIGTERM)
+        raise
+    except subprocess.TimeoutExpired:
+        terminate_process(process, signal.SIGTERM)
+        try:
+            stdout, _ = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            terminate_process(process, FORCE_KILL_SIGNAL)
+            stdout, _ = process.communicate()
+        message = f"\nTimed out after {timeout_seconds} seconds."
+        return ProcessResult(command, 124, (stdout or "") + message, time.monotonic() - started, True)
+
+
+def terminate_process(process: subprocess.Popen[str], sig: signal.Signals | None) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        if os.name != "nt":
+            os.killpg(process.pid, sig)
+        elif sig == signal.SIGTERM:
+            process.terminate()
+        else:
+            process.kill()
+    except ProcessLookupError:
+        return
 
 
 def project_root() -> pathlib.Path:
@@ -80,11 +135,23 @@ def connect(root: pathlib.Path) -> sqlite3.Connection:
             exit_code INTEGER,
             output_snippet TEXT,
             passed INTEGER NOT NULL CHECK(passed IN (0, 1)),
+            status TEXT NOT NULL DEFAULT 'FAIL' CHECK(status IN ('PASS', 'FAIL', 'SKIPPED', 'TIMEOUT')),
+            duration_seconds REAL,
+            metadata_json TEXT,
             created_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS checks_task_phase_idx ON checks(task_id, phase, id);
         """
     )
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(checks)").fetchall()}
+    if "status" not in columns:
+        connection.execute("ALTER TABLE checks ADD COLUMN status TEXT NOT NULL DEFAULT 'FAIL'")
+        connection.execute("UPDATE checks SET status = CASE WHEN passed = 1 THEN 'PASS' ELSE 'FAIL' END")
+    if "duration_seconds" not in columns:
+        connection.execute("ALTER TABLE checks ADD COLUMN duration_seconds REAL")
+    if "metadata_json" not in columns:
+        connection.execute("ALTER TABLE checks ADD COLUMN metadata_json TEXT")
+    connection.commit()
     return connection
 
 
@@ -123,14 +190,33 @@ def insert_check(
     exit_code: int | None,
     output: str,
     passed: bool,
+    status: str | None = None,
+    duration_seconds: float | None = None,
+    metadata: dict[str, object] | None = None,
 ) -> None:
     require_task(connection, task_id)
+    check_status = status or ("PASS" if passed else "FAIL")
+    if check_status not in CHECK_STATUSES:
+        raise SystemExit(f"Invalid check status: {check_status}")
     connection.execute(
         """
-        INSERT INTO checks(task_id, phase, check_name, tool, command, exit_code, output_snippet, passed, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO checks(task_id, phase, check_name, tool, command, exit_code, output_snippet, passed, status, duration_seconds, metadata_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (task_id, phase, check_name, tool, command, exit_code, snippet(output), int(passed), now()),
+        (
+            task_id,
+            phase,
+            check_name,
+            tool,
+            command,
+            exit_code,
+            snippet(output),
+            int(passed),
+            check_status,
+            duration_seconds,
+            json.dumps(metadata or {}, sort_keys=True) if metadata else None,
+            now(),
+        ),
     )
     connection.execute("UPDATE tasks SET updated_at = ? WHERE task_id = ?", (now(), task_id))
     connection.commit()
@@ -169,10 +255,10 @@ def cmd_recall(args: argparse.Namespace, root: pathlib.Path, connection: sqlite3
     file_path = normalize_file(root, args.file)
     rows = connection.execute(
         """
-        SELECT t.task_id, t.request, t.status, t.updated_at, c.phase, c.check_name, c.passed, c.output_snippet
+        SELECT t.task_id, t.request, t.status, t.updated_at, c.phase, c.check_name, c.passed, c.status AS check_status, c.output_snippet
         FROM task_files f
         JOIN tasks t ON t.task_id = f.task_id
-        LEFT JOIN checks c ON c.task_id = t.task_id AND c.passed = 0
+        LEFT JOIN checks c ON c.task_id = t.task_id AND c.status IN ('FAIL', 'TIMEOUT')
         WHERE f.file_path = ?
         ORDER BY t.updated_at DESC, c.id DESC
         LIMIT 20
@@ -186,10 +272,29 @@ def cmd_recall(args: argparse.Namespace, root: pathlib.Path, connection: sqlite3
 def cmd_record(args: argparse.Namespace, root: pathlib.Path, connection: sqlite3.Connection) -> int:
     del root
     output = args.output or ""
-    passed = args.passed if args.passed is not None else args.exit_code == 0
-    insert_check(connection, args.task, args.phase, args.check, args.tool, args.command, args.exit_code, output, passed)
-    print(f"Recorded {args.phase}/{args.check}: {'PASS' if passed else 'FAIL'}")
-    return 0 if passed else 1
+    if args.status:
+        status = args.status
+        if args.passed is not None and args.passed != (status == "PASS"):
+            raise SystemExit("--status and --passed disagree")
+    elif args.passed is not None:
+        status = "PASS" if args.passed else "FAIL"
+    else:
+        status = "PASS" if args.exit_code == 0 else "FAIL"
+    passed = args.passed if args.passed is not None else status == "PASS"
+    insert_check(
+        connection,
+        args.task,
+        args.phase,
+        args.check,
+        args.tool,
+        args.command,
+        args.exit_code,
+        output,
+        passed,
+        status=status,
+    )
+    print(f"Recorded {args.phase}/{args.check}: {status}")
+    return 0 if passed or status == "SKIPPED" else 1
 
 
 def cmd_run(args: argparse.Namespace, root: pathlib.Path, connection: sqlite3.Connection) -> int:
@@ -210,6 +315,7 @@ def cmd_run(args: argparse.Namespace, root: pathlib.Path, connection: sqlite3.Co
         result.returncode,
         result.stdout,
         result.returncode == 0,
+        duration_seconds=result.duration_seconds,
     )
     sys.stdout.write(result.stdout)
     print(f"\nRecorded {args.phase}/{args.check}: exit {result.returncode}")
@@ -225,37 +331,174 @@ def staged_diff(root: pathlib.Path) -> str:
     return result.stdout
 
 
-def cmd_review(args: argparse.Namespace, root: pathlib.Path, connection: sqlite3.Connection) -> int:
-    require_task(connection, args.task)
-    executable = REVIEWERS[args.reviewer][0]
-    if shutil.which(executable) is None:
-        message = f"Reviewer unavailable: {executable} is not installed or not on PATH."
-        insert_check(connection, args.task, "review", f"review-{args.reviewer}", args.reviewer, None, 127, message, False)
-        print(message)
-        return 127
+def review_command(reviewer: str) -> tuple[list[str], dict[str, object], bool]:
+    if reviewer == "gpt":
+        model = os.environ.get("EVIDENCE_FORGE_GPT_REVIEW_MODEL", DEFAULT_GPT_REVIEW_MODEL)
+        command = list(REVIEWERS[reviewer])
+        command[-1:-1] = ["-c", f"model={model}"]
+        return command, {"model": model}, True
+    if reviewer == "codex":
+        return list(REVIEWERS[reviewer]) + ["-"], {}, True
+    return list(REVIEWERS[reviewer]), {}, False
 
-    diff = staged_diff(root)
-    prompt = (
+
+def review_prompt(diff: str) -> str:
+    return (
         "Review this staged diff for bugs, security vulnerabilities, logic errors, race conditions, "
         "edge cases, missing error handling, and architectural violations. Ignore style-only issues. "
         "For each issue explain impact and a concrete fix. If there are no issues, say so.\n\n"
         f"{diff}"
     )
-    command = REVIEWERS[args.reviewer]
-    result = run_process(command + [prompt], root)
+
+
+def run_reviewer(
+    connection: sqlite3.Connection,
+    task_id: str,
+    reviewer: str,
+    root: pathlib.Path,
+    timeout_seconds: int,
+    max_diff_chars: int,
+) -> int:
+    require_task(connection, task_id)
+    command, metadata, prompt_via_stdin = review_command(reviewer)
+    command_text = " ".join(command) + (" <stdin>" if prompt_via_stdin else " <prompt>")
+    if timeout_seconds <= 0:
+        message = f"Review timeout must be a positive number of seconds; got {timeout_seconds}."
+        insert_check(
+            connection,
+            task_id,
+            "review",
+            f"review-{reviewer}",
+            reviewer,
+            command_text,
+            2,
+            message,
+            False,
+            status="FAIL",
+            metadata=metadata,
+        )
+        print(message)
+        return 2
+    if max_diff_chars <= 0:
+        message = f"Maximum review prompt size must be positive; got {max_diff_chars}."
+        insert_check(
+            connection,
+            task_id,
+            "review",
+            f"review-{reviewer}",
+            reviewer,
+            command_text,
+            2,
+            message,
+            False,
+            status="FAIL",
+            metadata=metadata,
+        )
+        print(message)
+        return 2
+    executable = command[0]
+    if shutil.which(executable) is None:
+        message = f"Reviewer unavailable: {executable} is not installed or not on PATH."
+        insert_check(
+            connection,
+            task_id,
+            "review",
+            f"review-{reviewer}",
+            reviewer,
+            None,
+            127,
+            message,
+            False,
+            status="SKIPPED",
+            metadata=metadata,
+        )
+        print(message)
+        return 127
+
+    diff = staged_diff(root)
+    prompt = review_prompt(diff)
+    if len(prompt) > max_diff_chars:
+        message = (
+            f"Review prompt is {len(prompt)} characters, which exceeds the "
+            f"{max_diff_chars} character single-review limit."
+        )
+        insert_check(
+            connection,
+            task_id,
+            "review",
+            f"review-{reviewer}",
+            reviewer,
+            command_text,
+            1,
+            message,
+            False,
+            status="FAIL",
+            metadata={
+                **metadata,
+                "diff_chars": len(diff),
+                "prompt_chars": len(prompt),
+                "max_diff_chars": max_diff_chars,
+            },
+        )
+        print(message)
+        return 1
+
+    metadata = {
+        **metadata,
+        "timeout_seconds": timeout_seconds,
+        "diff_chars": len(diff),
+        "prompt_chars": len(prompt),
+    }
+    result = run_process(
+        command if prompt_via_stdin else command + [prompt],
+        root,
+        input_text=prompt if prompt_via_stdin else None,
+        timeout_seconds=timeout_seconds,
+    )
+    status = "TIMEOUT" if result.timed_out else ("PASS" if result.returncode == 0 else "FAIL")
     insert_check(
         connection,
-        args.task,
+        task_id,
         "review",
-        f"review-{args.reviewer}",
-        args.reviewer,
-        " ".join(command) + " <prompt>",
+        f"review-{reviewer}",
+        reviewer,
+        command_text,
         result.returncode,
         result.stdout,
         result.returncode == 0,
+        status=status,
+        duration_seconds=result.duration_seconds,
+        metadata=metadata,
     )
     sys.stdout.write(result.stdout)
     return result.returncode
+
+
+def cmd_review(args: argparse.Namespace, root: pathlib.Path, connection: sqlite3.Connection) -> int:
+    return run_reviewer(
+        connection,
+        args.task,
+        args.reviewer,
+        root,
+        args.timeout_seconds,
+        args.max_diff_chars,
+    )
+
+
+def cmd_review_required(args: argparse.Namespace, root: pathlib.Path, connection: sqlite3.Connection) -> int:
+    final_code = 0
+    for reviewer in ("codex", "gpt"):
+        code = run_reviewer(
+            connection,
+            args.task,
+            reviewer,
+            root,
+            args.timeout_seconds,
+            args.max_diff_chars,
+        )
+        if code != 0:
+            final_code = code if final_code == 0 else final_code
+    return final_code
 
 
 def changed_files(root: pathlib.Path) -> set[str]:
@@ -327,7 +570,7 @@ def cmd_report(args: argparse.Namespace, root: pathlib.Path, connection: sqlite3
         "SELECT file_path FROM task_files WHERE task_id = ? ORDER BY file_path", (args.task,)
     ).fetchall()]
     checks = [dict(row) for row in connection.execute(
-        "SELECT phase, check_name, tool, command, exit_code, passed, output_snippet, created_at "
+        "SELECT phase, check_name, tool, command, exit_code, passed, status, duration_seconds, metadata_json, output_snippet, created_at "
         "FROM checks WHERE task_id = ? ORDER BY id", (args.task,)
     ).fetchall()]
     payload = {"task": dict(task), "files": files, "checks": checks}
@@ -353,12 +596,13 @@ def cmd_report(args: argparse.Namespace, root: pathlib.Path, connection: sqlite3
             continue
         print()
         print(f"## {phase.title()}")
-        print("| Check | Result | Tool | Command |")
-        print("|---|---|---|---|")
+        print("| Check | Result | Tool | Duration | Command |")
+        print("|---|---|---|---|---|")
         for check in phase_checks:
-            result = "PASS" if check["passed"] else "FAIL"
+            result = check.get("status") or ("PASS" if check["passed"] else "FAIL")
             command = (check["command"] or "").replace("|", "\\|")
-            print(f"| {check['check_name']} | {result} | {check['tool']} | `{command}` |")
+            duration = "" if check.get("duration_seconds") is None else f"{check['duration_seconds']:.1f}s"
+            print(f"| {check['check_name']} | {result} | {check['tool']} | {duration} | `{command}` |")
     return 0
 
 
@@ -389,6 +633,7 @@ def parser() -> argparse.ArgumentParser:
     record.add_argument("--command")
     record.add_argument("--exit-code", type=int)
     record.add_argument("--output")
+    record.add_argument("--status", choices=CHECK_STATUSES)
     record.add_argument("--passed", action=argparse.BooleanOptionalAction)
     record.set_defaults(func=cmd_record)
 
@@ -402,7 +647,15 @@ def parser() -> argparse.ArgumentParser:
     review = subparsers.add_parser("review")
     review.add_argument("--task", required=True)
     review.add_argument("--reviewer", choices=tuple(REVIEWERS), required=True)
+    review.add_argument("--timeout-seconds", type=int, default=DEFAULT_REVIEW_TIMEOUT_SECONDS)
+    review.add_argument("--max-diff-chars", type=int, default=DEFAULT_MAX_REVIEW_DIFF_CHARS)
     review.set_defaults(func=cmd_review)
+
+    review_required = subparsers.add_parser("review-required")
+    review_required.add_argument("--task", required=True)
+    review_required.add_argument("--timeout-seconds", type=int, default=DEFAULT_REVIEW_TIMEOUT_SECONDS)
+    review_required.add_argument("--max-diff-chars", type=int, default=DEFAULT_MAX_REVIEW_DIFF_CHARS)
+    review_required.set_defaults(func=cmd_review_required)
 
     commit = subparsers.add_parser("commit")
     commit.add_argument("--task", required=True)
